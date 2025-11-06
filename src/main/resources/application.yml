@@ -1,0 +1,39 @@
+server:
+  port: 9080
+
+spring:
+  application:
+    name: netty-websocket-server
+  
+  # Redis配置，用于分布式WebSocket会话共享
+  redis:
+    host: 10.110.161.9
+    port: 6379
+    database: 0
+    password: sd#ct#pd2303890652
+
+# 自定义Netty配置
+netty:
+  websocket:
+    port: 9081
+    bossGroupThreads: 2
+    workerGroupThreads: 16
+    maxFramePayloadLength: 65536
+    # WebSocket连接空闲超时时间（秒），默认3分钟
+    idleTimeout: 180
+
+# WebSocket安全配置
+websocket:
+  security:
+    token:
+      # 是否启用外部token验证接口
+      external:
+        enable: false
+        # 外部token验证接口URL
+        validate-url: http://localhost:8080/api/auth/validate-token
+        # 外部获取用户信息接口URL
+        user-info-url: http://localhost:8080/api/auth/user-info
+        # 外部接口请求超时时间（毫秒）
+        timeout: 3000
+      # 是否在外部接口失败时回退到本地验证
+      fallback-to-local: false
