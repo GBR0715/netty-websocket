@@ -52,20 +52,20 @@ public class NettyServerInitializer extends ChannelInitializer<SocketChannel> {
         pipeline.addLast(new IdleStateHandler(idleTimeout, 0, 0));
         // HTTP编解码器
         pipeline.addLast(new HttpServerCodec());
-        
+
         // 块写入处理器
         pipeline.addLast(new ChunkedWriteHandler());
-        
+
         // HTTP对象聚合器，将HTTP消息的多个部分合并成一个完整的HTTP消息
         pipeline.addLast(new HttpObjectAggregator(65536));
         
         // WebSocket协议处理器，处理握手、ping/pong、关闭等
-        pipeline.addLast(new WebSocketServerProtocolHandler(
-                WEBSOCKET_PATH, 
-                null, 
-                true, 
-                maxFramePayloadLength
-        ));
+        // pipeline.addLast(new WebSocketServerProtocolHandler(
+        //         WEBSOCKET_PATH,
+        //         null,
+        //         true,
+        //         maxFramePayloadLength
+        // ));
         
         // 为每个连接创建新的WebSocketHandler实例
         // 因为WebSocketHandler包含每个连接的状态，不能共享同一个实例

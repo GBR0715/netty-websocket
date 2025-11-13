@@ -61,7 +61,7 @@ public interface WebSocketConnectionManager {
      * 获取在线用户数量
      * @return 在线用户数量
      */
-    int getOnlineCount();
+    long getOnlineCount();
     
     /**
      * 获取用户组通道组

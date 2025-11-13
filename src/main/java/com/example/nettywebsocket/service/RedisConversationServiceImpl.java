@@ -2,14 +2,15 @@ package com.example.nettywebsocket.service;
 
 import com.example.nettywebsocket.model.Conversation;
 import com.example.nettywebsocket.model.MessageRecord;
+import com.example.nettywebsocket.util.RedisUtil;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -32,10 +33,17 @@ public class RedisConversationServiceImpl implements ConversationService {
     private static final long CONVERSATION_TTL = 7 * 24 * 60 * 60; // 7天
 
     @Autowired
-    private RedisTemplate<String, Object> redisTemplate;
+    private RedisUtil redisUtil;
     
     @Autowired
     private ObjectMapper objectMapper;
+    
+    // 本地内存存储（当Redis不可用时使用）
+    private final Map<String, Conversation> localConversations = new ConcurrentHashMap<>();
+    private final Map<String, List<MessageRecord>> localMessages = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> userConversations = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> agentConversations = new ConcurrentHashMap<>();
+    private final Map<String, String> activeConversations = new ConcurrentHashMap<>();
 
     @Override
     public Conversation createConversation(Conversation conversation) {
@@ -45,44 +53,65 @@ public class RedisConversationServiceImpl implements ConversationService {
                 conversation.setConversationId(UUID.randomUUID().toString());
             }
 
-            // 保存会话信息
-            String conversationKey = CONVERSATION_KEY + conversation.getConversationId();
-            redisTemplate.opsForValue().set(conversationKey, objectMapper.writeValueAsString(conversation));
-            // 设置过期时间为7天
-            redisTemplate.expire(conversationKey, 7, TimeUnit.DAYS);
+            if (redisUtil.isRedisAvailable()) {
+                // 保存会话信息到Redis
+                String conversationKey = CONVERSATION_KEY + conversation.getConversationId();
+                redisUtil.set(conversationKey, objectMapper.writeValueAsString(conversation), 7, TimeUnit.DAYS);
 
-            // 记录用户的会话列表
-            redisTemplate.opsForZSet().add(
-                    USER_CONVERSATIONS_KEY + conversation.getCreatorId(),
-                    conversation.getConversationId(),
-                    System.currentTimeMillis()
-            );
-            redisTemplate.opsForZSet().add(
-                    USER_CONVERSATIONS_KEY + conversation.getReceiverId(),
-                    conversation.getConversationId(),
-                    System.currentTimeMillis()
-            );
-
-            // 记录客服的会话列表（如果接收者是客服）
-            if ("AGENT".equals(conversation.getCreatorRole())) {
-                redisTemplate.opsForZSet().add(
-                        AGENT_CONVERSATIONS_KEY + conversation.getCreatorId(),
+                // 记录用户的会话列表
+                redisUtil.addToSortedSet(
+                        USER_CONVERSATIONS_KEY + conversation.getCreatorId(),
                         conversation.getConversationId(),
                         System.currentTimeMillis()
                 );
+                redisUtil.addToSortedSet(
+                        USER_CONVERSATIONS_KEY + conversation.getReceiverId(),
+                        conversation.getConversationId(),
+                        System.currentTimeMillis()
+                );
+
+                // 记录客服的会话列表（如果接收者是客服）
+                if ("AGENT".equals(conversation.getCreatorRole())) {
+                    redisUtil.addToSortedSet(
+                            AGENT_CONVERSATIONS_KEY + conversation.getCreatorId(),
+                            conversation.getConversationId(),
+                            System.currentTimeMillis()
+                    );
+                } else {
+                    redisUtil.addToSortedSet(
+                            AGENT_CONVERSATIONS_KEY + conversation.getReceiverId(),
+                            conversation.getConversationId(),
+                            System.currentTimeMillis()
+                    );
+                }
+
+                // 记录活跃会话
+                String activeKey = ACTIVE_CONVERSATION_KEY + conversation.getCreatorId() + ":" + conversation.getReceiverId();
+                redisUtil.set(activeKey, conversation.getConversationId());
+
+                logger.info("创建新会话: {}", conversation.getConversationId());
             } else {
-                redisTemplate.opsForZSet().add(
-                        AGENT_CONVERSATIONS_KEY + conversation.getReceiverId(),
-                        conversation.getConversationId(),
-                        System.currentTimeMillis()
-                );
+                // 使用本地内存存储
+                localConversations.put(conversation.getConversationId(), conversation);
+                
+                // 记录用户的会话列表
+                userConversations.computeIfAbsent(conversation.getCreatorId(), k -> ConcurrentHashMap.newKeySet()).add(conversation.getConversationId());
+                userConversations.computeIfAbsent(conversation.getReceiverId(), k -> ConcurrentHashMap.newKeySet()).add(conversation.getConversationId());
+                
+                // 记录客服的会话列表
+                if ("AGENT".equals(conversation.getCreatorRole())) {
+                    agentConversations.computeIfAbsent(conversation.getCreatorId(), k -> ConcurrentHashMap.newKeySet()).add(conversation.getConversationId());
+                } else {
+                    agentConversations.computeIfAbsent(conversation.getReceiverId(), k -> ConcurrentHashMap.newKeySet()).add(conversation.getConversationId());
+                }
+                
+                // 记录活跃会话
+                String activeKey = conversation.getCreatorId() + ":" + conversation.getReceiverId();
+                activeConversations.put(activeKey, conversation.getConversationId());
+                
+                logger.info("创建新会话（本地存储）: {}", conversation.getConversationId());
             }
-
-            // 记录活跃会话
-            String activeKey = ACTIVE_CONVERSATION_KEY + conversation.getCreatorId() + ":" + conversation.getReceiverId();
-            redisTemplate.opsForValue().set(activeKey, conversation.getConversationId());
-
-            logger.info("创建新会话: {}", conversation.getConversationId());
+            
             return conversation;
         } catch (Exception e) {
             logger.error("创建会话失败", e);
@@ -93,12 +122,17 @@ public class RedisConversationServiceImpl implements ConversationService {
     @Override
     public Conversation getConversationById(String conversationId) {
         try {
-            String conversationKey = CONVERSATION_KEY + conversationId;
-            String json = (String) redisTemplate.opsForValue().get(conversationKey);
-            return json != null ? objectMapper.readValue(json, Conversation.class) : null;
+            if (redisUtil.isRedisAvailable()) {
+                String conversationKey = CONVERSATION_KEY + conversationId;
+                String json = redisUtil.get(conversationKey,String.class);
+                return json != null ? objectMapper.readValue(json, Conversation.class) : null;
+            } else {
+                // 使用本地内存存储
+                return localConversations.get(conversationId);
+            }
         } catch (Exception e) {
             logger.error("获取会话失败: {}", conversationId, e);
-            return null;
+            throw new RuntimeException("获取会话失败", e);
         }
     }
 
@@ -113,11 +147,11 @@ public class RedisConversationServiceImpl implements ConversationService {
 
                 // 更新会话信息
                 String conversationKey = CONVERSATION_KEY + conversationId;
-                redisTemplate.opsForValue().set(conversationKey, objectMapper.writeValueAsString(conversation));
+                redisUtil.set(conversationKey, objectMapper.writeValueAsString(conversation));
 
                 // 移除活跃会话标记
                 String activeKey = ACTIVE_CONVERSATION_KEY + conversation.getCreatorId() + ":" + conversation.getReceiverId();
-                redisTemplate.delete(activeKey);
+                redisUtil.delete(activeKey);
 
                 logger.info("结束会话: {}, 结束类型: {}", conversationId, endType);
             }
@@ -131,24 +165,52 @@ public class RedisConversationServiceImpl implements ConversationService {
     @Override
     public List<Conversation> getUserConversations(String userId, int page, int size) {
         try {
-            String key = USER_CONVERSATIONS_KEY + userId;
-            int start = (page - 1) * size;
-            int end = page * size - 1;
+            if (redisUtil.isRedisAvailable()) {
+                String key = USER_CONVERSATIONS_KEY + userId;
+                int start = (page - 1) * size;
+                int end = page * size - 1;
 
-            // 获取会话ID列表（按时间倒序）
-            Set<Object> objectIds = redisTemplate.opsForZSet().reverseRange(key, start, end);
-            Set<String> conversationIds = objectIds != null ? 
-                    objectIds.stream().map(Object::toString).collect(Collectors.toSet()) : 
-                    new HashSet<>();
-            if (conversationIds.isEmpty()) {
-                return Collections.emptyList();
+                // 获取会话ID列表（按时间倒序）
+                Set<Object> objectIds = redisUtil.getSortedSetReverseRange(key, start, end);
+                Set<String> conversationIds = objectIds != null ? 
+                        objectIds.stream().map(Object::toString).collect(Collectors.toSet()) : 
+                        new HashSet<>();
+                if (conversationIds.isEmpty()) {
+                    return Collections.emptyList();
+                }
+
+                // 获取会话详情
+                return conversationIds.stream()
+                        .map(this::getConversationById)
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toList());
+            } else {
+                // 使用本地内存存储
+                Set<String> conversationIds = userConversations.get(userId);
+                if (conversationIds == null || conversationIds.isEmpty()) {
+                    return Collections.emptyList();
+                }
+                
+                // 分页逻辑
+                List<String> conversationIdList = new ArrayList<>(conversationIds);
+                int startIndex = (page - 1) * size;
+                int endIndex = Math.min(page * size, conversationIdList.size());
+                
+                if (startIndex >= conversationIdList.size()) {
+                    return Collections.emptyList();
+                }
+                
+                List<Conversation> conversations = new ArrayList<>();
+                for (int i = startIndex; i < endIndex; i++) {
+                    String conversationId = conversationIdList.get(i);
+                    Conversation conversation = localConversations.get(conversationId);
+                    if (conversation != null) {
+                        conversations.add(conversation);
+                    }
+                }
+                
+                return conversations;
             }
-
-            // 获取会话详情
-            return conversationIds.stream()
-                    .map(this::getConversationById)
-                    .filter(Objects::nonNull)
-                    .collect(Collectors.toList());
         } catch (Exception e) {
             logger.error("获取用户会话列表失败: {}", userId, e);
             return Collections.emptyList();
@@ -158,24 +220,52 @@ public class RedisConversationServiceImpl implements ConversationService {
     @Override
     public List<Conversation> getAgentConversations(String agentId, int page, int size) {
         try {
-            String key = AGENT_CONVERSATIONS_KEY + agentId;
-            int start = (page - 1) * size;
-            int end = page * size - 1;
+            if (redisUtil.isRedisAvailable()) {
+                String key = AGENT_CONVERSATIONS_KEY + agentId;
+                int start = (page - 1) * size;
+                int end = page * size - 1;
 
-            // 获取会话ID列表（按时间倒序）
-            Set<Object> objectIds = redisTemplate.opsForZSet().reverseRange(key, start, end);
-            Set<String> conversationIds = objectIds != null ? 
-                    objectIds.stream().map(Object::toString).collect(Collectors.toSet()) : 
-                    new HashSet<>();
-            if (conversationIds.isEmpty()) {
-                return Collections.emptyList();
+                // 获取会话ID列表（按时间倒序）
+                Set<Object> objectIds = redisUtil.getSortedSetReverseRange(key, start, end);
+                Set<String> conversationIds = objectIds != null ? 
+                        objectIds.stream().map(Object::toString).collect(Collectors.toSet()) : 
+                        new HashSet<>();
+                if (conversationIds.isEmpty()) {
+                    return Collections.emptyList();
+                }
+
+                // 获取会话详情
+                return conversationIds.stream()
+                        .map(this::getConversationById)
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toList());
+            } else {
+                // 使用本地内存存储
+                Set<String> conversationIds = agentConversations.get(agentId);
+                if (conversationIds == null || conversationIds.isEmpty()) {
+                    return Collections.emptyList();
+                }
+                
+                // 分页逻辑
+                List<String> conversationIdList = new ArrayList<>(conversationIds);
+                int startIndex = (page - 1) * size;
+                int endIndex = Math.min(page * size, conversationIdList.size());
+                
+                if (startIndex >= conversationIdList.size()) {
+                    return Collections.emptyList();
+                }
+                
+                List<Conversation> conversations = new ArrayList<>();
+                for (int i = startIndex; i < endIndex; i++) {
+                    String conversationId = conversationIdList.get(i);
+                    Conversation conversation = localConversations.get(conversationId);
+                    if (conversation != null) {
+                        conversations.add(conversation);
+                    }
+                }
+                
+                return conversations;
             }
-
-            // 获取会话详情
-            return conversationIds.stream()
-                    .map(this::getConversationById)
-                    .filter(Objects::nonNull)
-                    .collect(Collectors.toList());
         } catch (Exception e) {
             logger.error("获取客服会话列表失败: {}", agentId, e);
             return Collections.emptyList();
@@ -185,14 +275,27 @@ public class RedisConversationServiceImpl implements ConversationService {
     @Override
     public Conversation getActiveConversation(String userId, String agentId) {
         try {
-            String activeKey = ACTIVE_CONVERSATION_KEY + userId + ":" + agentId;
-            String conversationId = (String) redisTemplate.opsForValue().get(activeKey);
-            if (conversationId == null) {
-                // 尝试反向键名
-                activeKey = ACTIVE_CONVERSATION_KEY + agentId + ":" + userId;
-                conversationId = (String) redisTemplate.opsForValue().get(activeKey);
+            if (redisUtil.isRedisAvailable()) {
+                String activeKey = ACTIVE_CONVERSATION_KEY + userId + ":" + agentId;
+                String conversationId = redisUtil.get(activeKey,String.class);
+                if (conversationId == null) {
+                    // 尝试反向键名
+                    activeKey = ACTIVE_CONVERSATION_KEY + agentId + ":" + userId;
+                    conversationId = redisUtil.get(activeKey,String.class);
+                }
+                return conversationId != null ? getConversationById(conversationId) : null;
+            } else {
+                // 使用本地内存存储
+                String activeKey1 = userId + ":" + agentId;
+                String activeKey2 = agentId + ":" + userId;
+                
+                String conversationId = activeConversations.get(activeKey1);
+                if (conversationId == null) {
+                    conversationId = activeConversations.get(activeKey2);
+                }
+                
+                return conversationId != null ? localConversations.get(conversationId) : null;
             }
-            return conversationId != null ? getConversationById(conversationId) : null;
         } catch (Exception e) {
             logger.error("获取活跃会话失败: user={}, agent={}", userId, agentId, e);
             return null;
@@ -207,21 +310,34 @@ public class RedisConversationServiceImpl implements ConversationService {
                 messageRecord.setRecordId(UUID.randomUUID().toString());
             }
 
-            // 保存消息记录
-            String messageKey = MESSAGE_KEY + messageRecord.getConversationId();
-            redisTemplate.opsForList().leftPush(messageKey, objectMapper.writeValueAsString(messageRecord));
-            // 设置过期时间为7天
-            redisTemplate.expire(messageKey, 7, TimeUnit.DAYS);
+            if (redisUtil.isRedisAvailable()) {
+                // 保存消息记录到Redis
+                String messageKey = MESSAGE_KEY + messageRecord.getConversationId();
+                redisUtil.leftPushToList(messageKey, objectMapper.writeValueAsString(messageRecord));
+                redisUtil.expire(messageKey, 7, TimeUnit.DAYS);
 
-            // 更新会话的最后消息时间
-            Conversation conversation = getConversationById(messageRecord.getConversationId());
-            if (conversation != null) {
-                conversation.setLastMessageTime(new Date());
-                String conversationKey = CONVERSATION_KEY + conversation.getConversationId();
-                redisTemplate.opsForValue().set(conversationKey, objectMapper.writeValueAsString(conversation));
+                // 更新会话的最后消息时间
+                Conversation conversation = getConversationById(messageRecord.getConversationId());
+                if (conversation != null) {
+                    conversation.setLastMessageTime(new Date());
+                    String conversationKey = CONVERSATION_KEY + conversation.getConversationId();
+                    redisUtil.set(conversationKey, objectMapper.writeValueAsString(conversation));
+                }
+
+                logger.debug("保存消息记录: {}, 会话ID: {}", messageRecord.getRecordId(), messageRecord.getConversationId());
+            } else {
+                // 使用本地内存存储
+                localMessages.computeIfAbsent(messageRecord.getConversationId(), k -> new ArrayList<>()).add(0, messageRecord);
+                
+                // 更新会话的最后消息时间
+                Conversation conversation = localConversations.get(messageRecord.getConversationId());
+                if (conversation != null) {
+                    conversation.setLastMessageTime(new Date());
+                }
+                
+                logger.debug("保存消息记录（本地存储）: {}, 会话ID: {}", messageRecord.getRecordId(), messageRecord.getConversationId());
             }
-
-            logger.debug("保存消息记录: {}, 会话ID: {}", messageRecord.getRecordId(), messageRecord.getConversationId());
+            
             return messageRecord;
         } catch (Exception e) {
             logger.error("保存消息记录失败", e);
@@ -232,28 +348,46 @@ public class RedisConversationServiceImpl implements ConversationService {
     @Override
     public List<MessageRecord> getConversationMessages(String conversationId, int page, int size) {
         try {
-            String messageKey = MESSAGE_KEY + conversationId;
-            int start = (page - 1) * size;
-            int end = page * size - 1;
+            if (redisUtil.isRedisAvailable()) {
+                String messageKey = MESSAGE_KEY + conversationId;
+                int start = (page - 1) * size;
+                int end = page * size - 1;
 
-            // 获取消息记录列表
-            List<Object> messages = redisTemplate.opsForList().range(messageKey, start, end);
-            if (messages == null || messages.isEmpty()) {
-                return Collections.emptyList();
+                // 获取消息记录列表
+                List<Object> messages = redisUtil.getListRange(messageKey, start, end);
+                if (messages == null || messages.isEmpty()) {
+                    return Collections.emptyList();
+                }
+
+                // 转换为MessageRecord对象
+                return messages.stream()
+                        .map(msg -> {
+                            try {
+                                return objectMapper.readValue((String) msg, MessageRecord.class);
+                            } catch (Exception e) {
+                                logger.error("解析消息记录失败", e);
+                                return null;
+                            }
+                        })
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toList());
+            } else {
+                // 使用本地内存存储
+                List<MessageRecord> messages = localMessages.get(conversationId);
+                if (messages == null || messages.isEmpty()) {
+                    return Collections.emptyList();
+                }
+                
+                // 分页逻辑
+                int start = (page - 1) * size;
+                int end = Math.min(page * size, messages.size());
+                
+                if (start >= messages.size()) {
+                    return Collections.emptyList();
+                }
+                
+                return messages.subList(start, end);
             }
-
-            // 转换为MessageRecord对象
-            return messages.stream()
-                    .map(msg -> {
-                        try {
-                            return objectMapper.readValue((String) msg, MessageRecord.class);
-                        } catch (Exception e) {
-                            logger.error("解析消息记录失败", e);
-                            return null;
-                        }
-                    })
-                    .filter(Objects::nonNull)
-                    .collect(Collectors.toList());
         } catch (Exception e) {
             logger.error("获取会话消息失败: {}", conversationId, e);
             return Collections.emptyList();
@@ -290,16 +424,28 @@ public class RedisConversationServiceImpl implements ConversationService {
     public Map<String, Object> getConversationStatistics(String userId, String agentId) {
         Map<String, Object> stats = new HashMap<>();
         try {
-            // 获取用户的会话总数
-            String userKey = USER_CONVERSATIONS_KEY + userId;
-            Long userConversationCount = redisTemplate.opsForZSet().size(userKey);
-            stats.put("userConversationCount", userConversationCount != null ? userConversationCount : 0);
+            if (redisUtil.isRedisAvailable()) {
+                // 获取用户的会话总数
+                String userKey = USER_CONVERSATIONS_KEY + userId;
+                Long userConversationCount = redisUtil.getSortedSetSize(userKey);
+                stats.put("userConversationCount", userConversationCount != null ? userConversationCount : 0);
 
-            // 获取客服的会话总数
-            if (agentId != null) {
-                String agentKey = AGENT_CONVERSATIONS_KEY + agentId;
-                Long agentConversationCount = redisTemplate.opsForZSet().size(agentKey);
-                stats.put("agentConversationCount", agentConversationCount != null ? agentConversationCount : 0);
+                // 获取客服的会话总数
+                if (agentId != null) {
+                    String agentKey = AGENT_CONVERSATIONS_KEY + agentId;
+                    Long agentConversationCount = redisUtil.getSortedSetSize(agentKey);
+                    stats.put("agentConversationCount", agentConversationCount != null ? agentConversationCount : 0);
+                }
+            } else {
+                // 使用本地内存存储
+                Set<String> userConversationIds = userConversations.get(userId);
+                stats.put("userConversationCount", userConversationIds != null ? userConversationIds.size() : 0);
+
+                // 获取客服的会话总数
+                if (agentId != null) {
+                    Set<String> agentConversationIds = agentConversations.get(agentId);
+                    stats.put("agentConversationCount", agentConversationIds != null ? agentConversationIds.size() : 0);
+                }
             }
 
             // 更多统计信息可以根据需要添加
@@ -314,30 +460,70 @@ public class RedisConversationServiceImpl implements ConversationService {
         try {
             Conversation conversation = getConversationById(conversationId);
             if (conversation != null) {
-                // 删除会话信息
-                String conversationKey = CONVERSATION_KEY + conversationId;
-                redisTemplate.delete(conversationKey);
+                if (redisUtil.isRedisAvailable()) {
+                    // 删除会话信息
+                    String conversationKey = CONVERSATION_KEY + conversationId;
+                    redisUtil.delete(conversationKey);
 
-                // 从用户会话列表中移除
-                redisTemplate.opsForZSet().remove(USER_CONVERSATIONS_KEY + conversation.getCreatorId(), conversationId);
-                redisTemplate.opsForZSet().remove(USER_CONVERSATIONS_KEY + conversation.getReceiverId(), conversationId);
+                    // 从用户会话列表中移除
+                    redisUtil.remove(USER_CONVERSATIONS_KEY + conversation.getCreatorId(), conversationId);
+                    redisUtil.remove(USER_CONVERSATIONS_KEY + conversation.getReceiverId(), conversationId);
 
-                // 从客服会话列表中移除
-                if ("AGENT".equals(conversation.getCreatorRole())) {
-                    redisTemplate.opsForZSet().remove(AGENT_CONVERSATIONS_KEY + conversation.getCreatorId(), conversationId);
+                    // 从客服会话列表中移除
+                    if ("AGENT".equals(conversation.getCreatorRole())) {
+                        redisUtil.remove(AGENT_CONVERSATIONS_KEY + conversation.getCreatorId(), conversationId);
+                    } else {
+                        redisUtil.remove(AGENT_CONVERSATIONS_KEY + conversation.getReceiverId(), conversationId);
+                    }
+
+                    // 删除活跃会话标记
+                    String activeKey = ACTIVE_CONVERSATION_KEY + conversation.getCreatorId() + ":" + conversation.getReceiverId();
+                    redisUtil.delete(activeKey);
+
+                    // 删除消息记录
+                    String messageKey = MESSAGE_KEY + conversationId;
+                    redisUtil.delete(messageKey);
+
+                    logger.info("删除会话: {}", conversationId);
                 } else {
-                    redisTemplate.opsForZSet().remove(AGENT_CONVERSATIONS_KEY + conversation.getReceiverId(), conversationId);
+                    // 使用本地内存存储
+                    localConversations.remove(conversationId);
+                    
+                    // 从用户会话列表中移除
+                    Set<String> creatorConversations = userConversations.get(conversation.getCreatorId());
+                    if (creatorConversations != null) {
+                        creatorConversations.remove(conversationId);
+                    }
+                    
+                    Set<String> receiverConversations = userConversations.get(conversation.getReceiverId());
+                    if (receiverConversations != null) {
+                        receiverConversations.remove(conversationId);
+                    }
+                    
+                    // 从客服会话列表中移除
+                    if ("AGENT".equals(conversation.getCreatorRole())) {
+                        Set<String> agentConvs = agentConversations.get(conversation.getCreatorId());
+                        if (agentConvs != null) {
+                            agentConvs.remove(conversationId);
+                        }
+                    } else {
+                        Set<String> agentConvs = agentConversations.get(conversation.getReceiverId());
+                        if (agentConvs != null) {
+                            agentConvs.remove(conversationId);
+                        }
+                    }
+                    
+                    // 删除活跃会话标记
+                    String activeKey1 = conversation.getCreatorId() + ":" + conversation.getReceiverId();
+                    String activeKey2 = conversation.getReceiverId() + ":" + conversation.getCreatorId();
+                    activeConversations.remove(activeKey1);
+                    activeConversations.remove(activeKey2);
+                    
+                    // 删除消息记录
+                    localMessages.remove(conversationId);
+                    
+                    logger.info("删除会话（本地存储）: {}", conversationId);
                 }
-
-                // 删除活跃会话标记
-                String activeKey = ACTIVE_CONVERSATION_KEY + conversation.getCreatorId() + ":" + conversation.getReceiverId();
-                redisTemplate.delete(activeKey);
-
-                // 删除消息记录
-                String messageKey = MESSAGE_KEY + conversationId;
-                redisTemplate.delete(messageKey);
-
-                logger.info("删除会话: {}", conversationId);
                 return true;
             }
             return false;
@@ -350,7 +536,12 @@ public class RedisConversationServiceImpl implements ConversationService {
     @Override
     public void updateConversation(Conversation conversation) {
         try {
-            redisTemplate.opsForValue().set(CONVERSATION_KEY + conversation.getConversationId(), conversation);
+            if (redisUtil.isRedisAvailable()) {
+                redisUtil.set(CONVERSATION_KEY + conversation.getConversationId(), conversation);
+            } else {
+                // 使用本地内存存储
+                localConversations.put(conversation.getConversationId(), conversation);
+            }
         } catch (Exception e) {
             logger.error("更新会话失败", e);
         }
@@ -359,8 +550,13 @@ public class RedisConversationServiceImpl implements ConversationService {
     @Override
     public int getActiveSessionsCount() {
         try {
-            Set<Object> activeConversations = redisTemplate.opsForSet().members(ACTIVE_CONVERSATIONS_KEY);
-            return activeConversations != null ? activeConversations.size() : 0;
+            if (redisUtil.isRedisAvailable()) {
+                Set<Object> activeConversations = redisUtil.getSortedSetMembers(ACTIVE_CONVERSATIONS_KEY);
+                return activeConversations != null ? activeConversations.size() : 0;
+            } else {
+                // 使用本地内存存储
+                return activeConversations.size();
+            }
         } catch (Exception e) {
             logger.error("获取活跃会话数失败", e);
             return 0;

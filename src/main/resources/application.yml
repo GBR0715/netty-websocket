@@ -7,10 +7,16 @@ spring:
   
   # Redis配置，用于分布式WebSocket会话共享
   redis:
-    host: 10.110.161.9
+    host: localhost
     port: 6379
     database: 0
-    password: sd#ct#pd2303890652
+    #password:
+
+  # 日志配置
+  logging:
+    level:
+      org.springframework.data.redis: INFO
+      com.example.nettywebsocket: INFO
 
 # 自定义Netty配置
 netty:
@@ -20,7 +26,7 @@ netty:
     workerGroupThreads: 16
     maxFramePayloadLength: 65536
     # WebSocket连接空闲超时时间（秒），默认3分钟
-    idleTimeout: 180
+    idleTimeout: 1800
 
 # WebSocket安全配置
 websocket:
@@ -37,3 +43,7 @@ websocket:
         timeout: 3000
       # 是否在外部接口失败时回退到本地验证
       fallback-to-local: false
+      # Redis token存储配置
+      redis:
+        # token过期时间（秒），默认1小时
+        expire-time: 3600

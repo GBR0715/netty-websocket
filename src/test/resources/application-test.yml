@@ -1,0 +1,15 @@
+# 测试环境配置
+spring:
+  # 在测试环境中禁用Redis自动配置
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+
+# 测试环境禁用外部token验证
+websocket:
+  security:
+    token:
+      external:
+        enable: false
+      fallback-to-local: false

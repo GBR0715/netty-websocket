@@ -32,49 +32,49 @@ import java.util.UUID;
  */
 @Component
 public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
-    
+
     private static final Logger logger = LoggerFactory.getLogger(WebSocketHandler.class);
-    
+
     private WebSocketServerHandshaker handshaker;
     private static final String WEBSOCKET_PATH = "/websocket";
-    
+
     @Autowired
     private WebSocketConnectionManager connectionManager;
-    
+
     @Autowired
     private ObjectMapper objectMapper;
-    
+
     @Autowired
     private TokenService tokenService;
-    
+
     @Autowired
     private CustomerService customerService;
-    
+
     // 空闲超时时间（秒）
     @Value("${netty.websocket.idleTimeout:180}")
     private int idleTimeout;
-    
+
     // 存储当前连接的用户ID
     private String userId;
-    
+
     // 存储当前连接的token
     private String token;
-    
+
     // 用户角色：AGENT(客服) 或 USER(普通用户)
     private String userRole;
-    
+
     // 分配的客服ID（普通用户使用）
     private String assignedAgentId;
-    
+
     @Override
     public void channelActive(ChannelHandlerContext ctx) throws Exception {
         logger.info("客户端连接成功: {}", ctx.channel().remoteAddress());
     }
-    
+
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         logger.info("客户端断开连接: {}", ctx.channel().remoteAddress());
-        
+
         // 如果已经成功建立连接并有用户ID
         if (userId != null) {
             // 根据角色处理客服相关逻辑
@@ -88,11 +88,16 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
                 logger.info("普通用户 {} 已下线，从客服服务列表移除", userId);
             }
         }
-        
+
+        // 释放token
+        if (token != null) {
+            tokenService.releaseToken(token);
+        }
+
         // 从连接管理器中移除连接
         connectionManager.removeConnection(ctx.channel());
     }
-    
+
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, Object msg) throws Exception {
         // 处理HTTP请求，WebSocket握手
@@ -102,23 +107,33 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
         // 处理WebSocket消息
         else if (msg instanceof WebSocketFrame) {
             handleWebSocketFrame(ctx, (WebSocketFrame) msg);
+        } // 处理其他类型的消息（如Netty内部消息），直接传递给下一个handler
+        else {
+            ctx.fireChannelRead(msg);
         }
     }
-    
+
     /**
      * 处理HTTP请求，完成WebSocket握手
      */
     private void handleHttpRequest(ChannelHandlerContext ctx, FullHttpRequest req) throws Exception {
+        // 验证路径
+        if (!req.uri().startsWith(WEBSOCKET_PATH)) {
+            logger.warn("无效的WebSocket路径: {}", req.uri());
+            sendHttpResponse(ctx, req, new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.NOT_FOUND));
+            return;
+        }
+
         // 要求GET方法
         if (!req.method().name().equals("GET")) {
             sendHttpResponse(ctx, req, new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.FORBIDDEN));
             return;
         }
-        
+
         // 从请求参数中获取token
         String uri = req.uri();
         String token = null;
-        
+
         if (uri.contains("?")) {
             String query = uri.substring(uri.indexOf("?") + 1);
             String[] params = query.split("&");
@@ -130,7 +145,7 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
                 }
             }
         }
-        
+
         // 如果没有提供token，尝试从请求头获取
         if (token == null) {
             token = req.headers().get("Authorization");
@@ -138,7 +153,7 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
                 token = token.substring(7); // 移除 "Bearer " 前缀
             }
         }
-        
+
         // 验证token
         boolean tokenValid = false;
         if (token != null && !token.isEmpty()) {
@@ -149,7 +164,7 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
                 logger.info("WebSocket连接token验证成功: userId={}", userId);
             }
         }
-        
+
         // 如果token无效，拒绝连接
         if (!tokenValid || userId == null) {
             logger.warn("WebSocket连接token验证失败");
@@ -160,7 +175,7 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
             sendHttpResponse(ctx, req, response);
             return;
         }
-        
+        this.token = token;
         // 构建WebSocket握手响应
         WebSocketServerHandshakerFactory factory = new WebSocketServerHandshakerFactory(
                 getWebSocketLocation(req), null, true);
@@ -172,13 +187,13 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
             // 从请求参数中获取用户角色
             String role = req.uri().contains("role=agent") ? "AGENT" : "USER";
             this.userRole = role;
-            
+
             // 根据角色处理
             if ("AGENT".equals(role)) {
                 // 客服角色，注册到客服系统
                 customerService.registerAgent(userId);
                 logger.info("客服 {} 已上线", userId);
-                
+
                 // 发送欢迎消息给客服
                 WebSocketMessage welcomeMsg = new WebSocketMessage("SYSTEM", "欢迎回来！您可以开始为客户服务了。", "server", userId);
                 sendMessage(ctx, objectMapper.writeValueAsString(welcomeMsg));
@@ -186,7 +201,7 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
                 // 普通用户角色，分配客服
                 String agentId = customerService.assignCustomerService(userId);
                 this.assignedAgentId = agentId;
-                
+
                 if (agentId != null) {
                     logger.info("普通用户 {} 已分配给客服 {}", userId, agentId);
                 } else {
@@ -196,26 +211,26 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
                     sendMessage(ctx, objectMapper.writeValueAsString(waitingMsg));
                 }
             }
-            
+
             // 握手成功后，将连接添加到管理器
             connectionManager.addConnection(userId, ctx.channel());
-            
+
             // 发送连接成功消息
-            WebSocketMessage welcomeMsg = new WebSocketMessage("SYSTEM", 
-                    role.equals("AGENT") ? "客服连接成功" : "用户连接成功", 
+            WebSocketMessage welcomeMsg = new WebSocketMessage("SYSTEM",
+                    role.equals("AGENT") ? "客服连接成功" : "用户连接成功",
                     "server", userId);
-            
+
             // 添加额外信息
             if ("USER".equals(role) && assignedAgentId != null) {
                 welcomeMsg.setContent(welcomeMsg.getContent() + ", 您的客服是: " + assignedAgentId);
             }
-            
+
             sendMessage(ctx, objectMapper.writeValueAsString(welcomeMsg));
-            
+
             logger.info("用户 {} WebSocket连接成功，角色 = {}", userId, role);
         }
     }
-    
+
     /**
      * 处理WebSocket帧消息
      */
@@ -226,24 +241,24 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
             handshaker.close(ctx.channel(), (CloseWebSocketFrame) frame.retain());
             return;
         }
-        
+
         // Ping帧
         if (frame instanceof PingWebSocketFrame) {
             ctx.channel().write(new PongWebSocketFrame(frame.content().retain()));
             return;
         }
-        
+
         // 文本帧
         if (frame instanceof TextWebSocketFrame) {
             String text = ((TextWebSocketFrame) frame).text();
             logger.info("收到用户 {} 的消息: {}", userId, text);
-            
+
             try {
                 // 解析消息
                 WebSocketMessage message = objectMapper.readValue(text, WebSocketMessage.class);
                 message.setSenderId(userId);
                 message.setMessageId(UUID.randomUUID().toString());
-                
+
                 // 客服消息处理
                 if ("AGENT".equals(userRole)) {
                     // 客服发送消息给用户
@@ -308,20 +323,20 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
             }
             return;
         }
-        
+
         // 二进制帧处理（如果需要）
         if (frame instanceof BinaryWebSocketFrame) {
             // 这里可以添加二进制消息的处理逻辑
             logger.info("收到二进制消息，长度: {}", frame.content().readableBytes());
         }
     }
-    
+
     /**
      * 处理聊天消息
      */
     private void handleChatMessage(ChannelHandlerContext ctx, WebSocketMessage message) throws Exception {
         String receiverId = message.getReceiverId();
-        
+
         // 记录消息到会话历史
         if ("AGENT".equals(userRole)) {
             // 客服发送消息，调用handleAgentMessage记录
@@ -330,59 +345,59 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
             // 用户发送消息，调用handleUserMessage记录
             customerService.handleUserMessage(message);
         }
-        
+
         // 发送给接收者
         boolean sent = connectionManager.sendMessage(receiverId, objectMapper.writeValueAsString(message));
-        
+
         // 发送确认消息给发送者
         WebSocketMessage confirmMsg = new WebSocketMessage(
-                "CONFIRM", 
-                sent ? "消息已发送" : "接收者不在线", 
-                "server", 
+                "CONFIRM",
+                sent ? "消息已发送" : "接收者不在线",
+                "server",
                 userId
         );
         confirmMsg.setMessageId(message.getMessageId());
         sendMessage(ctx, objectMapper.writeValueAsString(confirmMsg));
     }
-    
+
     /**
      * 处理群组消息
      */
     private void handleGroupMessage(ChannelHandlerContext ctx, WebSocketMessage message) throws Exception {
         String groupId = message.getReceiverId();
-        
+
         // 发送到群组
         connectionManager.sendToGroup(groupId, objectMapper.writeValueAsString(message));
-        
+
         // 发送确认消息
         WebSocketMessage confirmMsg = new WebSocketMessage(
-                "CONFIRM", 
-                "群组消息已发送", 
-                "server", 
+                "CONFIRM",
+                "群组消息已发送",
+                "server",
                 userId
         );
         confirmMsg.setMessageId(message.getMessageId());
         sendMessage(ctx, objectMapper.writeValueAsString(confirmMsg));
     }
-    
+
     /**
      * 处理广播消息
      */
     private void handleBroadcastMessage(ChannelHandlerContext ctx, WebSocketMessage message) throws Exception {
         // 广播消息
         connectionManager.broadcast(objectMapper.writeValueAsString(message));
-        
+
         // 发送确认消息
         WebSocketMessage confirmMsg = new WebSocketMessage(
-                "CONFIRM", 
-                "广播消息已发送", 
-                "server", 
+                "CONFIRM",
+                "广播消息已发送",
+                "server",
                 userId
         );
         confirmMsg.setMessageId(message.getMessageId());
         sendMessage(ctx, objectMapper.writeValueAsString(confirmMsg));
     }
-    
+
     /**
      * 发送HTTP响应
      */
@@ -393,11 +408,11 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
             res.content().writeBytes(buf);
             buf.release();
         }
-        
+
         // 发送响应并关闭连接
         ctx.channel().writeAndFlush(res).addListener(ChannelFutureListener.CLOSE);
     }
-    
+
     /**
      * 获取WebSocket地址
      */
@@ -405,20 +420,20 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
         String location = req.headers().get(HttpHeaderNames.HOST) + WEBSOCKET_PATH;
         return "ws://" + location;
     }
-    
+
     /**
      * 发送消息
      */
     private void sendMessage(ChannelHandlerContext ctx, String message) {
         ctx.channel().writeAndFlush(new TextWebSocketFrame(message));
     }
-    
+
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
         logger.error("WebSocket异常", cause);
-        ctx.close();
+        // ctx.close();
     }
-    
+
     @Override
     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
         if (evt instanceof IdleStateEvent) {
@@ -440,26 +455,26 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<Object> {
         }
         super.userEventTriggered(ctx, evt);
     }
-    
+
     // 移除硬编码的idleTimeout，使用@Value注入的值
-    
+
     // Setter方法，用于手动注入依赖
     public void setConnectionManager(WebSocketConnectionManager connectionManager) {
         this.connectionManager = connectionManager;
     }
-    
+
     public void setObjectMapper(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
     }
-    
+
     public void setTokenService(TokenService tokenService) {
         this.tokenService = tokenService;
     }
-    
+
     public void setCustomerService(CustomerService customerService) {
         this.customerService = customerService;
     }
-    
+
     public void setIdleTimeout(int idleTimeout) {
         this.idleTimeout = idleTimeout;
     }
